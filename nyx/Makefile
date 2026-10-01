@@ -29,7 +29,7 @@ TRACK_LDFLAGS = $(BUILDDIR)/.ldflags
 # Main and graphics.
 OBJS =  start exception_handlers nyx heap gfx \
 		gui gui_info gui_tools gui_options gui_emmc_tools gui_emummc_tools gui_tools_partition_manager \
-		fe_emummc_tools fe_emmc_tools gui_file_manager
+		fe_emummc_tools fe_emmc_tools gui_file_manager gui_updater
 
 # Hardware.
 OBJS += actmon bpmp ccplex clock di vic i2c irq timer \
@@ -50,7 +50,7 @@ OBJS += hos pkg1 pkg2
 
 # Libraries.
 OBJS += diskio ff ffunicode ffsystem \
-		elfload elfreloc_arm blz \
+		elfload elfreloc_arm blz tinf \
 		lv_group lv_indev lv_obj lv_refr lv_style lv_vdb \
 		lv_draw lv_draw_rbasic lv_draw_vbasic lv_draw_arc lv_draw_img \
 		lv_draw_label lv_draw_line lv_draw_rect lv_draw_triangle \

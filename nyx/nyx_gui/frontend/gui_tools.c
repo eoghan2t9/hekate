@@ -25,6 +25,7 @@
 #include "gui_emmc_tools.h"
 #include "fe_emummc_tools.h"
 #include "gui_file_manager.h"
+#include "gui_updater.h"
 #include "../config.h"
 #include "../hos/pkg1.h"
 #include "../hos/pkg2.h"
@@ -1643,6 +1644,22 @@ static void _create_tab_tools_emmc_sd_usb(lv_theme_t *th, lv_obj_t *parent)
 		"#C7EA46 Long press an entry for more actions.#");
 	lv_obj_set_style(label_txt4, &hint_small_style);
 	lv_obj_align(label_txt4, btn5, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
+
+	// Create SD Updater button.
+	lv_obj_t *btn6 = lv_btn_create(h2, btn3);
+	label_btn = lv_label_create(btn6, NULL);
+	lv_label_set_static_text(label_btn, SYMBOL_DOWNLOAD"  SD Updater");
+	lv_obj_align(btn6, label_txt4, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 2);
+	lv_btn_set_action(btn6, LV_BTN_ACTION_CLICK, create_window_updater_tool);
+
+	label_txt4 = lv_label_create(h2, NULL);
+	lv_label_set_recolor(label_txt4, true);
+	lv_label_set_static_text(label_txt4,
+		"Update hekate, Nyx and Atmosph\u00e8re from packages in\n"
+		"#C7EA46 sd:/update/#. Zips and extracted folders are supported\n"
+		"and replaced files are backed up to #C7EA46 update/backup#.");
+	lv_obj_set_style(label_txt4, &hint_small_style);
+	lv_obj_align(label_txt4, btn6, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
 }
 
 static void _create_tab_tools_arc_rcm_pkg12(lv_theme_t *th, lv_obj_t *parent)
