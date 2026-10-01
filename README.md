@@ -25,9 +25,11 @@ Custom Graphical Nintendo Switch bootloader, firmware patcher, tools, and many m
 - **HOS (Switch OS) Bootloader** -- For CFW Sys/Emu, OFW Sys and Stock Sys
 - **Android & Linux Bootloader**
 - **Payload Launcher**
-- **eMMC/emuMMC Backup/Restore Tools**
+- **eMMC/emuMMC Backup/Restore Tools** -- Supports file based emuMMC.
 - **SD Card Partition Manager** -- Prepares and formats SD Card for any combo of HOS (Sys/emuMMC), Android and Linux
 - **emuMMC Creation & Manager** -- Can also migrate and fix existing emuMMC
+- **File Manager** -- Browse SD, eMMC and emuMMC files. eMMC/emuMMC write access is locked behind a confirmation.
+- **SD Updater** -- Update hekate, Nyx and Atmosphère from packages in `update/`. Supports zips and extracted folders. Replaced files are backed up automatically.
 - **Switch Android & Linux flasher**
 - **USB Mass Storage (UMS) for SD/eMMC/emuMMC** -- Converts Switch into a SD Card Reader
 - **USB Gamepad** -- Converts Switch with Joycon into a USB HID Gamepad
@@ -61,6 +63,7 @@ Custom Graphical Nintendo Switch bootloader, firmware patcher, tools, and many m
 | bootloader/screenshots/  | Folder where Nyx screenshots are saved                                |
 | bootloader/payloads/     | For the `Payloads` menu. All CFW bootloaders, tools, Linux payloads are supported. Autoboot only supported by including them into an ini. |
 | bootloader/libtools/     | Reserved                                                              |
+| update/                  | Folder for the Nyx `SD Updater`. Zips or extracted folders with hekate/Nyx/Atmosphère updates. Replaced files are backed up in `update/backup`. |
 
 
 
@@ -220,6 +223,8 @@ Open source and free packages used:
    Copyright (c) 2003-2006, Marcus Geelnard
  - blz,
    Copyright (c) 2018, SciresM
+ - tinf - tiny inflate,
+   Copyright (c) 2003-2019, Joergen Ibsen
  - elfload,
    Copyright (c) 2014 Owen Shepherd,
    Copyright (c) 2018 M4xw
