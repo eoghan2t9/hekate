@@ -35,6 +35,7 @@ typedef struct _emmc_tool_gui_t
 	char *txt_buf;
 	char *base_path;
 	bool raw_emummc;
+	bool file_emummc;
 } emmc_tool_gui_t;
 
 typedef struct _gui_status_bar_ctx

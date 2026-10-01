@@ -22,6 +22,7 @@
 #include "gui_emmc_tools.h"
 #include "gui_tools.h"
 #include "fe_emmc_tools.h"
+#include "fe_emummc_tools.h"
 #include "../config.h"
 #include "../hos/pkg1.h"
 #include "../hos/pkg2.h"
@@ -37,6 +38,7 @@ typedef struct _emmc_backup_buttons_t
 	lv_obj_t *emmc_sys;
 	lv_obj_t *emmc_usr;
 	bool raw_emummc;
+	bool file_emummc;
 	bool restore;
 } emmc_backup_buttons_t;
 
@@ -47,6 +49,7 @@ static void _create_window_backup_restore(emmcPartType_t type, const char* win_l
 	emmc_tool_gui_t emmc_tool_gui_ctxt;
 
 	emmc_tool_gui_ctxt.raw_emummc = emmc_btn_ctxt.raw_emummc;
+	emmc_tool_gui_ctxt.file_emummc = emmc_btn_ctxt.file_emummc;
 
 	char win_label_full[80];
 
@@ -259,13 +262,17 @@ static lv_res_t _emmc_backup_buttons_raw_toggle(lv_obj_t *btn)
 			lv_label_set_static_text(lv_obj_get_child(emmc_btn_ctxt.emmc_raw_gpp, NULL), SYMBOL_DOWNLOAD"  SD emuMMC RAW GPP");
 		lv_obj_realign(emmc_btn_ctxt.emmc_raw_gpp);
 
-		lv_obj_set_click(emmc_btn_ctxt.emmc_sys, false);
-		lv_btn_set_state(emmc_btn_ctxt.emmc_sys, LV_BTN_STATE_INA);
-
-		if (!emmc_btn_ctxt.restore)
+		// File based emuMMC supports SYS/USER partition backup and restore.
+		if (!emmc_btn_ctxt.file_emummc)
 		{
-			lv_obj_set_click(emmc_btn_ctxt.emmc_usr, false);
-			lv_btn_set_state(emmc_btn_ctxt.emmc_usr, LV_BTN_STATE_INA);
+			lv_obj_set_click(emmc_btn_ctxt.emmc_sys, false);
+			lv_btn_set_state(emmc_btn_ctxt.emmc_sys, LV_BTN_STATE_INA);
+
+			if (!emmc_btn_ctxt.restore)
+			{
+				lv_obj_set_click(emmc_btn_ctxt.emmc_usr, false);
+				lv_btn_set_state(emmc_btn_ctxt.emmc_usr, LV_BTN_STATE_INA);
+			}
 		}
 
 		emmc_btn_ctxt.raw_emummc = true;
@@ -460,9 +467,41 @@ lv_res_t create_window_backup_restore_tool(lv_obj_t *btn)
 	lv_cont_set_layout(h3, LV_LAYOUT_OFF);
 	lv_obj_align(h3, h1, LV_ALIGN_OUT_BOTTOM_LEFT, LV_DPI * 38 / 11, LV_DPI / 7);
 
+	// Detect file based emuMMC. Its part files get used directly for backups.
+	emmc_btn_ctxt.file_emummc = false;
+	if (!h_cfg.emummc_force_disable)
+	{
+		emummc_cfg_t emu_info;
+		load_emummc_cfg(&emu_info);
+
+		if (emu_info.enabled && !emu_info.sector && emu_info.path)
+		{
+			char *path = (char *)malloc(strlen(emu_info.path) + 12);
+			if (path)
+			{
+				strcpy(path, emu_info.path);
+				if (path[strlen(path) - 1] != '/')
+					strcat(path, "/");
+				strcat(path, "eMMC/00");
+
+				FILINFO fno;
+				emmc_btn_ctxt.file_emummc = !f_stat(path, &fno);
+
+				free(path);
+			}
+		}
+
+		free(emu_info.path);
+		free(emu_info.nintendo_path);
+	}
+
 	lv_obj_t *sd_emummc_raw = lv_btn_create(h3, NULL);
-	nyx_create_onoff_button(lv_theme_get_current(), h3,
-		sd_emummc_raw, SYMBOL_SD" SD emuMMC Raw Partition", _emmc_backup_buttons_raw_toggle, false);
+	if (emmc_btn_ctxt.file_emummc)
+		nyx_create_onoff_button(lv_theme_get_current(), h3,
+			sd_emummc_raw, SYMBOL_SD" SD emuMMC File Based", _emmc_backup_buttons_raw_toggle, false);
+	else
+		nyx_create_onoff_button(lv_theme_get_current(), h3,
+			sd_emummc_raw, SYMBOL_SD" SD emuMMC Raw Partition", _emmc_backup_buttons_raw_toggle, false);
 	emmc_btn_ctxt.raw_emummc = false;
 
 	return LV_RES_OK;
