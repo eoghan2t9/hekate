@@ -51,6 +51,7 @@ typedef struct _fm_ctx_t
 	bool bis_is_emummc;
 	bool bis_user_part;
 	bool bis_keys_derived;
+	bool bis_write_unlocked;
 	FATFS bis_fs;
 	link_t bis_gpt;
 	const char *src_name;
@@ -73,6 +74,7 @@ static void _fm_list_dir(fm_ctx_t *ctx);
 static lv_res_t _fm_delete_confirm_action(lv_obj_t *btns, const char *txt);
 static lv_res_t _fm_file_menu_action(lv_obj_t *btns, const char *txt);
 static lv_res_t _fm_action_close_emmc(lv_obj_t *btn);
+static bool _fm_write_access_request();
 
 // Read sectors from a file based emuMMC. Handles part file spanning.
 static int _fm_emummc_file_read_sectors(u32 sector, u32 count, void *buff)
@@ -219,6 +221,11 @@ static void _fm_bis_unmount(fm_ctx_t *ctx)
 	list_init(&ctx->bis_gpt);
 	if (!ctx->bis_is_emummc)
 		emmc_end();
+
+	// Re-enable write protection for the next mount.
+	bool allow_writes = false;
+	disk_set_info(DRIVE_BIS, SET_WRITE_PROTECT, &allow_writes);
+	ctx->bis_write_unlocked = false;
 
 	// Only invalidate clipboard if it points to the BIS volume.
 	if (ctx->clip_path[0] && !strncmp(ctx->clip_path, "bis:", 4))
@@ -618,12 +625,9 @@ static lv_res_t _fm_action_paste(lv_obj_t *btn)
 	strcpy(src, ctx->clip_path);
 	_fm_path_join(dst, ctx->path, name);
 
-	// eMMC/emuMMC partitions are browsed read-only.
-	if (!strncmp(ctx->path, "bis:", 4))
-	{
-		_fm_error_box("#FFDD00 eMMC/emuMMC is read-only!#");
+	// eMMC/emuMMC writes are gated behind an explicit unlock.
+	if (!strncmp(ctx->path, "bis:", 4) && !_fm_write_access_request())
 		goto out;
-	}
 
 	// Do not allow pasting a folder into itself.
 	u32 clip_len = strlen(ctx->clip_path);
@@ -738,7 +742,12 @@ static void _fm_file_menu(const char *path, bool is_dir)
 		s_printf(txt_buf, "%s\n\n%s", is_dir ? "#FF8000 Folder#" : "#FF8000 File#", path);
 
 	if (bis)
-		strcat(txt_buf, "\n\n#C7EA46 Read-only. Copy to paste into the SD card.#");
+	{
+		if (fm_ctx.bis_write_unlocked)
+			strcat(txt_buf, "\n\n#FF8000 Write access unlocked! Careful.#");
+		else
+			strcat(txt_buf, "\n\n#C7EA46 Read-only. Copy to paste into the SD card.#");
+	}
 	else if (is_dir)
 		strcat(txt_buf, "\n\n#C7EA46 Copy pastes the whole folder. Long press to open menu.#");
 	else
@@ -747,9 +756,9 @@ static void _fm_file_menu(const char *path, bool is_dir)
 	lv_mbox_set_text(mbox, txt_buf);
 	free(txt_buf);
 
-	if (bis)
+	if (bis && !fm_ctx.bis_write_unlocked)
 	{
-		// Copy only. The BIS volume is read-only.
+		// Copy only until write access is unlocked.
 		static const char *mbox_btn_map_bis[] = { "\222Copy", "\222Close", "" };
 		lv_mbox_add_btns(mbox, mbox_btn_map_bis, _fm_file_menu_action);
 	}
@@ -866,6 +875,88 @@ static lv_res_t _fm_action_entry_long(lv_obj_t *btn)
 	return LV_RES_OK;
 }
 
+static lv_res_t _fm_action_close_emmc(lv_obj_t *btn)
+{
+	fm_ctx_t *ctx = &fm_ctx;
+
+	ctx->path[0] = 0;
+	_fm_bis_unmount(ctx);
+
+	_fm_list_dir(ctx);
+
+	return LV_RES_OK;
+}
+
+static lv_res_t _fm_unlock_action(lv_obj_t *btns, const char *txt)
+{
+	lv_obj_t *mbox = lv_mbox_get_from_btn(btns);
+	lv_obj_t *dark_bg = lv_obj_get_parent(mbox);
+
+	if (!strcmp(txt, "Unlock"))
+	{
+		bool allow_writes = true;
+		disk_set_info(DRIVE_BIS, SET_WRITE_PROTECT, &allow_writes);
+		fm_ctx.bis_write_unlocked = true;
+	}
+
+	lv_obj_del(dark_bg);
+	_fm_list_dir(&fm_ctx);
+
+	return LV_RES_INV;
+}
+
+static bool _fm_write_access_request()
+{
+	// Already unlocked.
+	if (fm_ctx.bis_write_unlocked)
+		return true;
+
+	// File based emuMMC stays read-only. It is user data, but on the SD card.
+	if (fm_ctx.bis_is_emummc && fm_ctx.emummc_file_available)
+	{
+		_fm_error_box("#FFDD00 File based emuMMC stays read-only!#");
+		return false;
+	}
+
+	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
+	lv_obj_set_style(dark_bg, &mbox_darken);
+	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
+
+	static const char *mbox_btn_map[] = { "\222Unlock", "\222Cancel", "" };
+	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
+	lv_mbox_set_recolor_text(mbox, true);
+	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 5);
+
+	char *txt_buf = (char *)malloc(SZ_4K);
+	s_printf(txt_buf,
+			 "#FF8000 Enable write access?#\n\n"
+			 "Writes go straight to the %s partition.\n\n"
+			 "#FF3C28 Deleting HOS files can brick the OS install!#",
+			 fm_ctx.src_name);
+	lv_mbox_set_text(mbox, txt_buf);
+	free(txt_buf);
+
+	lv_mbox_add_btns(mbox, mbox_btn_map, _fm_unlock_action);
+	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
+	lv_obj_set_top(mbox, true);
+
+	return false; // Menu action re-lists on dismiss.
+}
+
+static lv_res_t _fm_action_lock_emmc(lv_obj_t *btn)
+{
+	fm_ctx_t *ctx = &fm_ctx;
+
+	// Restore write protection.
+	bool allow_writes = false;
+	disk_set_info(DRIVE_BIS, SET_WRITE_PROTECT, &allow_writes);
+	ctx->bis_write_unlocked = false;
+
+	_fm_list_dir(ctx);
+
+	return LV_RES_OK;
+}
+
 static void _fm_list_dir(fm_ctx_t *ctx)
 {
 	lv_list_clean(ctx->list);
@@ -897,9 +988,19 @@ static void _fm_list_dir(fm_ctx_t *ctx)
 	{
 		lv_list_add(ctx->list, NULL, SYMBOL_REFRESH" Refresh", _fm_action_refresh);
 
-		// eMMC/emuMMC partitions are browsed read-only.
+		// eMMC/emuMMC write actions depend on the unlock state.
 		if (!strncmp(ctx->path, "bis:", 4))
 		{
+			if (ctx->bis_write_unlocked)
+			{
+				lv_list_add(ctx->list, NULL, SYMBOL_DIRECTORY" New Folder", _fm_action_new_folder);
+
+				if (ctx->clip_path[0])
+					lv_list_add(ctx->list, NULL, SYMBOL_COPY" Paste", _fm_action_paste);
+
+				lv_list_add(ctx->list, NULL, SYMBOL_KEY" Lock writes", _fm_action_lock_emmc);
+			}
+
 			char *txt_buf = (char *)malloc(SZ_4K);
 			s_printf(txt_buf, SYMBOL_CLOSE" Close %s", ctx->src_name);
 			lv_list_add(ctx->list, NULL, txt_buf, _fm_action_close_emmc);
@@ -935,18 +1036,6 @@ static void _fm_list_dir(fm_ctx_t *ctx)
 	free(txt_buf);
 
 	manual_system_maintenance(true);
-}
-
-static lv_res_t _fm_action_close_emmc(lv_obj_t *btn)
-{
-	fm_ctx_t *ctx = &fm_ctx;
-
-	ctx->path[0] = 0;
-	_fm_bis_unmount(ctx);
-
-	_fm_list_dir(ctx);
-
-	return LV_RES_OK;
 }
 
 static lv_res_t _fm_action_close(lv_obj_t *btn)
