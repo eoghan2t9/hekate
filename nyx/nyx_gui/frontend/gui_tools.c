@@ -24,6 +24,7 @@
 #include "gui_tools_partition_manager.h"
 #include "gui_emmc_tools.h"
 #include "fe_emummc_tools.h"
+#include "gui_file_manager.h"
 #include "../config.h"
 #include "../hos/pkg1.h"
 #include "../hos/pkg2.h"
@@ -1626,6 +1627,21 @@ static void _create_tab_tools_emmc_sd_usb(lv_theme_t *th, lv_obj_t *parent)
 		"gamepad transforms the Switch into an input device.#");
 	lv_obj_set_style(label_txt4, &hint_small_style);
 	lv_obj_align(label_txt4, btn4, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
+
+	// Create File Manager button.
+	lv_obj_t *btn5 = lv_btn_create(h2, btn3);
+	label_btn = lv_label_create(btn5, NULL);
+	lv_label_set_static_text(label_btn, SYMBOL_DRIVE"  SD File Manager");
+	lv_obj_align(btn5, label_txt4, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 2);
+	lv_btn_set_action(btn5, LV_BTN_ACTION_CLICK, create_window_file_manager_tool);
+
+	label_txt4 = lv_label_create(h2, NULL);
+	lv_label_set_recolor(label_txt4, true);
+	lv_label_set_static_text(label_txt4,
+		"Browse, copy, delete and create folders on the SD card.\n"
+		"#C7EA46 Long press an entry for more actions.#");
+	lv_obj_set_style(label_txt4, &hint_small_style);
+	lv_obj_align(label_txt4, btn5, LV_ALIGN_OUT_BOTTOM_LEFT, 0, LV_DPI / 3);
 }
 
 static void _create_tab_tools_arc_rcm_pkg12(lv_theme_t *th, lv_obj_t *parent)
