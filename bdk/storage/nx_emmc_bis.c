@@ -18,6 +18,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
 #include <memory_map.h>
 
@@ -57,6 +58,18 @@ static emmc_part_t *system_part = NULL;
 static u32 *cache_lookup_tbl = (u32 *)NX_BIS_LOOKUP_ADDR;
 static bis_cache_t *bis_cache = (bis_cache_t *)NX_BIS_CACHE_ADDR;
 
+// File backed emuMMC state. Path is NULL when not in file backed mode.
+// A single FIL handle is kept open and re-opened only when the part file changes.
+static FIL   bis_file_fp = { 0 };
+static char *bis_file_path = NULL;
+static u32   bis_file_part_size = 0;  // Sectors per part file.
+static bool  bis_file_fp_open = false;
+static u32   bis_file_fp_part = 0;    // Part index the open handle belongs to.
+static bool  bis_file_fp_write = false; // Open mode of the open handle.
+
+static int _nx_emmc_bis_file_read(u32 sector, u32 count, void *buff);
+static int _nx_emmc_bis_file_write(u32 sector, u32 count, void *buff);
+
 static int nx_emmc_bis_write_block(u32 sector, u32 count, void *buff, bool flush)
 {
 	if (!system_part)
@@ -95,7 +108,9 @@ static int nx_emmc_bis_write_block(u32 sector, u32 count, void *buff, bool flush
 		return 1; // Encryption error.
 
 	// If not reading from cache, do a regular read and decrypt.
-	if (!emu_offset)
+	if (bis_file_path)
+		res = _nx_emmc_bis_file_write(system_part->lba_start + sector, count, bis_cache->dma_buff);
+	else if (!emu_offset)
 		res = emmc_part_write(system_part, sector, count, bis_cache->dma_buff);
 	else
 		res = sdmmc_storage_write(&sd_storage, emu_offset + system_part->lba_start + sector, count, bis_cache->dma_buff);
@@ -155,7 +170,9 @@ static int nx_emmc_bis_read_block_normal(u32 sector, u32 count, void *buff)
 	u32  sector_in_cluster = sector % BIS_CLUSTER_SECTORS;
 
 	// If not reading from cache, do a regular read and decrypt.
-	if (!emu_offset)
+	if (bis_file_path)
+		res = _nx_emmc_bis_file_read(system_part->lba_start + sector, count, bis_cache->dma_buff);
+	else if (!emu_offset)
 		res = emmc_part_read(system_part, sector, count, bis_cache->dma_buff);
 	else
 		res = sdmmc_storage_read(&sd_storage, emu_offset + system_part->lba_start + sector, count, bis_cache->dma_buff);
@@ -212,7 +229,9 @@ static int nx_emmc_bis_read_block_cached(u32 sector, u32 count, void *buff)
 	cache_lookup_tbl[cluster] = bis_cache->top_idx;
 
 	// Read the whole cluster the sector resides in.
-	if (!emu_offset)
+	if (bis_file_path)
+		res = _nx_emmc_bis_file_read(system_part->lba_start + cluster_sector, BIS_CLUSTER_SECTORS, bis_cache->dma_buff);
+	else if (!emu_offset)
 		res = emmc_part_read(system_part, cluster_sector, BIS_CLUSTER_SECTORS, bis_cache->dma_buff);
 	else
 		res = sdmmc_storage_read(&sd_storage, emu_offset + system_part->lba_start + cluster_sector, BIS_CLUSTER_SECTORS, bis_cache->dma_buff);
@@ -292,8 +311,100 @@ int nx_emmc_bis_write(u32 sector, u32 count, void *buff)
 	return 0;
 }
 
+static void _nx_emmc_bis_file_close()
+{
+	if (bis_file_fp_open)
+	{
+		f_close(&bis_file_fp);
+		bis_file_fp_open = false;
+	}
+}
+
+// Open the part file that contains the sector, if not open already.
+// The handle is cached and re-opened only when the part index or mode changes.
+static int _nx_emmc_bis_file_seek(u32 sector, u32 count, bool write)
+{
+	u32 file_part = sector / bis_file_part_size;
+	u32 file_sector = sector % bis_file_part_size;
+
+	// Re-open when switching part files or modes. FatFs handles cannot switch
+	// between read and write without re-opening.
+	if (!bis_file_fp_open || bis_file_fp_part != file_part || bis_file_fp_write != write)
+	{
+		_nx_emmc_bis_file_close();
+
+		// Set part file index. Path is always null terminated with 2 digit index.
+		if (file_part >= 10)
+			itoa(file_part, bis_file_path + strlen(bis_file_path) - 2, 10);
+		else
+		{
+			bis_file_path[strlen(bis_file_path) - 2] = '0';
+			itoa(file_part, bis_file_path + strlen(bis_file_path) - 1, 10);
+		}
+
+		if (f_open(&bis_file_fp, bis_file_path, write ? FA_WRITE : FA_READ))
+			return 1;
+
+		bis_file_fp_open = true;
+		bis_file_fp_part = file_part;
+		bis_file_fp_write = write;
+	}
+
+	// Skip the seek if the file pointer is already at the target. Cheap win
+	// for the common sequential access pattern.
+	if (f_tell(&bis_file_fp) != ((u64)file_sector << 9) &&
+		f_lseek(&bis_file_fp, (u64)file_sector << 9))
+	{
+		_nx_emmc_bis_file_close();
+		return 1;
+	}
+
+	return 0;
+}
+
+static int _nx_emmc_bis_file_read(u32 sector, u32 count, void *buff)
+{
+	UINT read_bytes = 0;
+
+	if (_nx_emmc_bis_file_seek(sector, count, false))
+		return 1;
+
+	if (f_read(&bis_file_fp, buff, (u64)count << 9, &read_bytes) || read_bytes != count << 9)
+	{
+		_nx_emmc_bis_file_close();
+		return 1;
+	}
+
+	return 0;
+}
+
+static int _nx_emmc_bis_file_write(u32 sector, u32 count, void *buff)
+{
+	UINT written_bytes = 0;
+
+	if (_nx_emmc_bis_file_seek(sector, count, true))
+		return 1;
+
+	if (f_write(&bis_file_fp, buff, (u64)count << 9, &written_bytes) || written_bytes != count << 9)
+	{
+		_nx_emmc_bis_file_close();
+		return 1;
+	}
+
+	return 0;
+}
+
 void nx_emmc_bis_init(emmc_part_t *part, bool enable_cache, u32 emummc_offset)
 {
+	// Reset any previous file backed mode.
+	_nx_emmc_bis_file_close();
+	if (bis_file_path)
+	{
+		free(bis_file_path);
+		bis_file_path = NULL;
+	}
+	bis_file_part_size = 0;
+
 	system_part = part;
 	emu_offset = emummc_offset;
 
@@ -318,8 +429,40 @@ void nx_emmc_bis_init(emmc_part_t *part, bool enable_cache, u32 emummc_offset)
 		system_part = NULL;
 }
 
+void nx_emmc_bis_init_file(emmc_part_t *part, bool enable_cache, const char *path, u32 part_size)
+{
+	// Reset any previous session. Also handles key selection.
+	nx_emmc_bis_init(part, enable_cache, 0);
+	if (!system_part)
+		return;
+
+	// Copy path and append part file index.
+	u32 len = strlen(path);
+	char *new_path = malloc(len + 4);
+	if (!new_path)
+	{
+		system_part = NULL;
+		return;
+	}
+	strcpy(new_path, path);
+	if (len && new_path[len - 1] != '/')
+		strcat(new_path, "/");
+	strcat(new_path, "00");
+
+	bis_file_path = new_path;
+	bis_file_part_size = part_size;
+}
+
 void nx_emmc_bis_end()
 {
 	_nx_emmc_bis_flush_cache();
 	system_part = NULL;
+
+	_nx_emmc_bis_file_close();
+	if (bis_file_path)
+	{
+		free(bis_file_path);
+		bis_file_path = NULL;
+	}
+	bis_file_part_size = 0;
 }
