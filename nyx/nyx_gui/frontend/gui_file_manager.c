@@ -38,6 +38,16 @@
 #define FM_DRIVE_EMU_SYS   ((void *)3)
 #define FM_DRIVE_EMU_USER  ((void *)4)
 
+// A single listed directory entry. Backing storage for the list's free_ptr tags.
+typedef struct _fm_entry_t
+{
+	char name[256];
+	u64  size;
+	u16  fdate;
+	u16  ftime;
+	bool is_dir;
+} fm_entry_t;
+
 typedef struct _fm_ctx_t
 {
 	lv_obj_t *win;
@@ -46,6 +56,10 @@ typedef struct _fm_ctx_t
 	char path[FM_PATH_MAX];
 	char clip_path[FM_PATH_MAX];
 	bool clip_is_dir;
+	bool clip_is_cut; // false: Copy, true: Cut (same volume move only).
+	// Current directory listing. Freed/reallocated on every _fm_list_dir().
+	fm_entry_t *entries;
+	u32 entry_count;
 	// eMMC/emuMMC BIS state.
 	bool bis_mounted;
 	bool bis_is_emummc;
@@ -70,11 +84,23 @@ static fm_ctx_t fm_ctx;
 static char fm_menu_path[FM_PATH_MAX];
 static bool fm_menu_is_dir;
 
+// Context for a pending paste that needs an overwrite confirmation first.
+static char fm_paste_src[FM_PATH_MAX];
+static char fm_paste_dst[FM_PATH_MAX];
+static bool fm_paste_dst_is_dir;
+
+// Context for the generic text input modal (keyboard + text area).
+typedef void (*fm_text_input_cb_t)(const char *text);
+static lv_obj_t *fm_ti_dark_bg;
+static lv_obj_t *fm_ti_ta;
+static fm_text_input_cb_t fm_ti_callback;
+
 static void _fm_list_dir(fm_ctx_t *ctx);
 static lv_res_t _fm_delete_confirm_action(lv_obj_t *btns, const char *txt);
 static lv_res_t _fm_file_menu_action(lv_obj_t *btns, const char *txt);
 static lv_res_t _fm_action_close_emmc(lv_obj_t *btn);
 static bool _fm_write_access_request();
+static void _fm_text_input_open(const char *title, const char *prefill, fm_text_input_cb_t cb);
 
 // Read sectors from a file based emuMMC. Handles part file spanning.
 static int _fm_emummc_file_read_sectors(u32 sector, u32 count, void *buff)
@@ -339,6 +365,182 @@ static void _fm_error_box(const char *text)
 	lv_obj_set_top(mbox, true);
 }
 
+// Generic text input modal (on-screen keyboard + text area). Single instance, so static is safe.
+static lv_res_t _fm_text_input_ok(lv_obj_t *kb)
+{
+	// Copy out before deleting the modal (and the text area with it).
+	char text[256];
+	strncpy(text, lv_ta_get_text(fm_ti_ta), sizeof(text) - 1);
+	text[sizeof(text) - 1] = 0;
+
+	lv_obj_del(fm_ti_dark_bg);
+	fm_ti_dark_bg = NULL;
+	fm_ti_ta = NULL;
+
+	if (fm_ti_callback)
+		fm_ti_callback(text);
+
+	return LV_RES_INV;
+}
+
+static lv_res_t _fm_text_input_cancel(lv_obj_t *kb)
+{
+	lv_obj_del(fm_ti_dark_bg);
+	fm_ti_dark_bg = NULL;
+	fm_ti_ta = NULL;
+
+	return LV_RES_INV;
+}
+
+static void _fm_text_input_open(const char *title, const char *prefill, fm_text_input_cb_t cb)
+{
+	fm_ti_callback = cb;
+
+	fm_ti_dark_bg = lv_obj_create(lv_scr_act(), NULL);
+	lv_obj_set_style(fm_ti_dark_bg, &mbox_darken);
+	lv_obj_set_size(fm_ti_dark_bg, LV_HOR_RES, LV_VER_RES);
+
+	lv_obj_t *title_label = lv_label_create(fm_ti_dark_bg, NULL);
+	lv_label_set_recolor(title_label, true);
+	lv_label_set_text(title_label, title);
+	lv_obj_align(title_label, NULL, LV_ALIGN_IN_TOP_MID, 0, LV_DPI / 3);
+
+	fm_ti_ta = lv_ta_create(fm_ti_dark_bg, NULL);
+	lv_ta_set_one_line(fm_ti_ta, true);
+	lv_ta_set_max_length(fm_ti_ta, 254);
+	if (prefill)
+		lv_ta_set_text(fm_ti_ta, prefill);
+	lv_ta_set_cursor_pos(fm_ti_ta, LV_TA_CURSOR_LAST);
+	lv_obj_set_width(fm_ti_ta, LV_HOR_RES * 7 / 9);
+	lv_obj_align(fm_ti_ta, title_label, LV_ALIGN_OUT_BOTTOM_MID, 0, LV_DPI / 4);
+
+	lv_obj_t *kb = lv_kb_create(fm_ti_dark_bg, NULL);
+	lv_kb_set_ta(kb, fm_ti_ta);
+	lv_kb_set_ok_action(kb, _fm_text_input_ok);
+	lv_kb_set_hide_action(kb, _fm_text_input_cancel);
+	lv_obj_set_width(kb, LV_HOR_RES * 8 / 9);
+	lv_obj_set_height(kb, LV_VER_RES / 2);
+	lv_obj_align(kb, NULL, LV_ALIGN_IN_BOTTOM_MID, 0, -LV_DPI / 6);
+
+	lv_obj_set_top(fm_ti_dark_bg, true);
+}
+
+// Format a byte size as a short human readable string. No float support, so compute one decimal by hand.
+static void _fm_format_size(char *buf, u64 size)
+{
+	if (size < SZ_1K)
+		s_printf(buf, "%d B", (u32)size);
+	else if (size < SZ_1M)
+		s_printf(buf, "%d KiB", (u32)(size / SZ_1K));
+	else if (size < SZ_1G)
+		s_printf(buf, "%d.%d MiB", (u32)(size / SZ_1M), (u32)((size * 10 / SZ_1M) % 10));
+	else
+		s_printf(buf, "%d.%d GiB", (u32)(size / SZ_1G), (u32)((size * 10 / SZ_1G) % 10));
+}
+
+// Format a FatFs date/time pair (fdate/ftime bitfields) as "YYYY-MM-DD HH:MM".
+static void _fm_format_date(char *buf, u16 fdate, u16 ftime)
+{
+	s_printf(buf, "%d-%02d-%02d %02d:%02d",
+			 ((fdate >> 9) & 0x7F) + 1980, (fdate >> 5) & 0x0F, fdate & 0x1F,
+			 (ftime >> 11) & 0x1F, (ftime >> 5) & 0x3F);
+}
+
+// Append the current volume's free space to a path label buffer.
+static void _fm_format_free_space(char *buf, const char *path)
+{
+	DWORD free_clst;
+	FATFS *fs;
+
+	if (f_getfree(path, &free_clst, &fs))
+	{
+		buf[0] = 0;
+		return;
+	}
+
+	char size_buf[32];
+	_fm_format_size(size_buf, (u64)free_clst * fs->csize * 512);
+	s_printf(buf, "   Free: %s", size_buf);
+}
+
+// Sort folders first, then alphabetically (case-insensitive) within each group.
+static int _fm_entry_cmp(const void *a, const void *b)
+{
+	const fm_entry_t *ea = (const fm_entry_t *)a;
+	const fm_entry_t *eb = (const fm_entry_t *)b;
+
+	if (ea->is_dir != eb->is_dir)
+		return eb->is_dir - ea->is_dir;
+
+	return strcasecmp(ea->name, eb->name);
+}
+
+// Read a directory into a sorted array of entries. Replaces dirlist(), which can only
+// return files or folders exclusively, never both, and carries no size/date/type info.
+static fm_entry_t *_fm_read_dir(const char *path, u32 *out_count)
+{
+	DIR dir;
+	FILINFO fno;
+
+	*out_count = 0;
+
+	if (f_opendir(&dir, path) != FR_OK)
+		return NULL;
+
+	u32 count = 0;
+	for (;;)
+	{
+		if (f_readdir(&dir, &fno) != FR_OK || !fno.fname[0])
+			break;
+		if (fno.fname[0] == '.')
+			continue;
+		count++;
+	}
+	f_closedir(&dir);
+
+	if (!count)
+		return NULL;
+
+	fm_entry_t *entries = (fm_entry_t *)calloc(count, sizeof(fm_entry_t));
+	if (!entries)
+		return NULL;
+
+	if (f_opendir(&dir, path) != FR_OK)
+	{
+		free(entries);
+		return NULL;
+	}
+
+	u32 i = 0;
+	while (i < count)
+	{
+		if (f_readdir(&dir, &fno) != FR_OK || !fno.fname[0])
+			break;
+		if (fno.fname[0] == '.')
+			continue;
+
+		strcpy(entries[i].name, fno.fname);
+		entries[i].size    = fno.fsize;
+		entries[i].fdate   = fno.fdate;
+		entries[i].ftime   = fno.ftime;
+		entries[i].is_dir  = !!(fno.fattrib & AM_DIR);
+		i++;
+	}
+	f_closedir(&dir);
+
+	*out_count = i;
+	qsort(entries, i, sizeof(fm_entry_t), _fm_entry_cmp);
+
+	return entries;
+}
+
+// Reject characters FAT/exFAT forbid in a file name. f_rename()/f_mkdir() are still
+// the final authority; this is just an early, friendlier error message.
+static bool _fm_name_is_valid(const char *name)
+{
+	return name[0] && !strpbrk(name, "\"*/:<>?\\|");
+}
+
 static void _fm_path_join(char *dst, const char *dir, const char *name)
 {
 	u32 len = strlen(dir);
@@ -583,30 +785,131 @@ static lv_res_t _fm_action_refresh(lv_obj_t *btn)
 	return LV_RES_OK;
 }
 
-static lv_res_t _fm_action_new_folder(lv_obj_t *btn)
+static void _fm_new_folder_cb(const char *text)
 {
 	fm_ctx_t *ctx = &fm_ctx;
-	char *path = (char *)malloc(FM_PATH_MAX);
 
-	// Auto-name the folder, avoiding collisions.
-	for (u32 i = 0; i < 1000; i++)
+	if (!text[0])
+		return; // Cancelled/empty. Leave the listing as is.
+
+	if (!_fm_name_is_valid(text))
 	{
-		if (i)
-			s_printf(path, "%s/NewFolder%d", ctx->path, i);
-		else
-			s_printf(path, "%s/NewFolder", ctx->path);
-
-		if (f_stat(path, NULL))
-			break;
+		_fm_error_box("#FFDD00 Name has invalid characters!#");
+		return;
 	}
 
-	if (f_mkdir(path))
+	char path[FM_PATH_MAX];
+	_fm_path_join(path, ctx->path, text);
+
+	if (!path[0])
+		_fm_error_box("#FFDD00 Name is too long!#");
+	else if (!f_stat(path, NULL))
+		_fm_error_box("#FFDD00 That name is already used!#");
+	else if (f_mkdir(path))
 		_fm_error_box("#FFDD00 Failed to create folder!#");
 
-	free(path);
 	_fm_list_dir(ctx);
+}
+
+static lv_res_t _fm_action_new_folder(lv_obj_t *btn)
+{
+	_fm_text_input_open("#FF8000 New folder name#", "NewFolder", _fm_new_folder_cb);
 
 	return LV_RES_OK;
+}
+
+// True if src and dst name the same mounted volume (text before the first ':').
+static bool _fm_same_volume(const char *src, const char *dst)
+{
+	const char *src_colon = strchr(src, ':');
+	const char *dst_colon = strchr(dst, ':');
+
+	if (!src_colon || !dst_colon || (src_colon - src) != (dst_colon - dst))
+		return false;
+
+	return !strncmp(src, dst, src_colon - src);
+}
+
+// Executes the actual paste. dst_is_dir/dst_existed describe what, if anything, is
+// already at dst (the caller either confirmed overwriting it, or there was nothing there).
+static void _fm_do_paste(fm_ctx_t *ctx, const char *src, const char *dst, bool dst_is_dir, bool dst_existed)
+{
+	// Cut within the same volume is a plain rename: instant, and no temp duplicate on disk.
+	if (ctx->clip_is_cut && _fm_same_volume(src, dst))
+	{
+		bool result = true;
+
+		if (dst_existed)
+			result = dst_is_dir ? _fm_delete_dir(dst) : !f_unlink(dst);
+
+		if (result && f_rename(src, dst))
+			result = false;
+
+		if (!result)
+			_fm_error_box("#FFDD00 Failed to move!#");
+		else
+			ctx->clip_path[0] = 0; // Source is gone. Copy's clipboard is left for repeated pasting.
+
+		_fm_list_dir(ctx);
+		return;
+	}
+
+	lv_obj_t *bar = NULL;
+	lv_obj_t *dark_bg = _fm_progress_box_create("#00DDFF Copying...#\n ", &bar);
+	manual_system_maintenance(true);
+
+	if (ctx->clip_is_dir)
+	{
+		if (!_fm_copy_dir(src, dst, bar))
+			_fm_error_box("#FFDD00 Failed to copy folder!#");
+	}
+	else
+	{
+		if (!_fm_copy_file(src, dst, bar))
+			_fm_error_box("#FFDD00 Failed to copy file!#");
+	}
+
+	_fm_progress_box_close(dark_bg);
+	_fm_list_dir(ctx);
+}
+
+static lv_res_t _fm_overwrite_confirm_action(lv_obj_t *btns, const char *txt)
+{
+	lv_obj_t *mbox = lv_mbox_get_from_btn(btns);
+	lv_obj_t *dark_bg = lv_obj_get_parent(mbox);
+	lv_obj_del(dark_bg);
+
+	if (!strcmp(txt, "Replace"))
+		_fm_do_paste(&fm_ctx, fm_paste_src, fm_paste_dst, fm_paste_dst_is_dir, true);
+	else
+		_fm_list_dir(&fm_ctx);
+
+	return LV_RES_INV;
+}
+
+static void _fm_overwrite_confirm(void)
+{
+	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
+	lv_obj_set_style(dark_bg, &mbox_darken);
+	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
+
+	static const char *mbox_btn_map[] = { "\222Replace", "\222Cancel", "" };
+	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
+	lv_mbox_set_recolor_text(mbox, true);
+	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 5);
+
+	char *txt_buf = (char *)malloc(SZ_4K);
+	s_printf(txt_buf,
+			 "#FF8000 Replace existing %s?#\n\n"
+			 "%s\n\n"
+			 "#FF3C28 This operation can not be undone!#",
+			 fm_paste_dst_is_dir ? "folder" : "file", fm_paste_dst);
+	lv_mbox_set_text(mbox, txt_buf);
+	free(txt_buf);
+
+	lv_mbox_add_btns(mbox, mbox_btn_map, _fm_overwrite_confirm_action);
+	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
+	lv_obj_set_top(mbox, true);
 }
 
 static lv_res_t _fm_action_paste(lv_obj_t *btn)
@@ -640,33 +943,63 @@ static lv_res_t _fm_action_paste(lv_obj_t *btn)
 	}
 
 	// Do not allow pasting a file onto itself.
-	if (!ctx->clip_is_dir && !strcmp(src, dst))
+	if (!strcmp(src, dst))
 	{
 		_fm_error_box("#FFDD00 Source and destination are the same!#");
 		goto out;
 	}
 
-	lv_obj_t *bar = NULL;
-	lv_obj_t *dark_bg = _fm_progress_box_create("#00DDFF Copying...#\n ", &bar);
-	manual_system_maintenance(true);
-
-	if (ctx->clip_is_dir)
+	// Cut can only be fulfilled as an actual move within the same volume. A cross volume
+	// move would need a copy plus a source delete, which is a much riskier operation to
+	// leave half-finished on eMMC/emuMMC, so it's not supported here.
+	if (ctx->clip_is_cut && !_fm_same_volume(src, dst))
 	{
-		if (!_fm_copy_dir(src, dst, bar))
-			_fm_error_box("#FFDD00 Failed to copy folder!#");
-	}
-	else
-	{
-		if (!_fm_copy_file(src, dst, bar))
-			_fm_error_box("#FFDD00 Failed to copy file!#");
+		_fm_error_box("#FFDD00 Can't move between SD and eMMC/emuMMC. Copy instead.#");
+		goto out;
 	}
 
-	_fm_progress_box_close(dark_bg);
+	FILINFO dst_fno;
+	bool dst_exists = !f_stat(dst, &dst_fno);
+	bool dst_is_dir = dst_exists && (dst_fno.fattrib & AM_DIR);
+	bool move_now = ctx->clip_is_cut && _fm_same_volume(src, dst);
+
+	if (dst_exists)
+	{
+		// Folder-into-folder copy keeps its existing silent merge behavior.
+		if (!move_now && ctx->clip_is_dir && dst_is_dir)
+		{
+			_fm_do_paste(ctx, src, dst, true, true);
+			goto out;
+		}
+
+		if (ctx->clip_is_dir != dst_is_dir)
+		{
+			_fm_error_box(dst_is_dir ?
+				"#FFDD00 Can't replace a folder with a file!#" :
+				"#FFDD00 Can't replace a file with a folder!#");
+			goto out;
+		}
+
+		// A move can't merge folders the way a copy can; renaming over one fails outright.
+		if (move_now && dst_is_dir)
+		{
+			_fm_error_box("#FFDD00 A folder with that name already exists here!#");
+			goto out;
+		}
+
+		// Something will be overwritten. Confirm first.
+		strcpy(fm_paste_src, src);
+		strcpy(fm_paste_dst, dst);
+		fm_paste_dst_is_dir = dst_is_dir;
+		_fm_overwrite_confirm();
+		goto out;
+	}
+
+	_fm_do_paste(ctx, src, dst, false, false);
 
 out:
 	free(src);
 	free(dst);
-	_fm_list_dir(ctx);
 
 	return LV_RES_OK;
 }
@@ -730,7 +1063,7 @@ static void _fm_file_menu(const char *path, bool is_dir)
 	lv_obj_set_style(dark_bg, &mbox_darken);
 	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
 
-	static const char *mbox_btn_map[] = { "\222Copy", "\222Delete", "\222Cancel", "" };
+	static const char *mbox_btn_map[] = { "\222Copy", "\222Cut", "\222Rename", "\n", "\222Delete", "\222Cancel", "" };
 	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
 	lv_mbox_set_recolor_text(mbox, true);
 	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 6);
@@ -758,14 +1091,56 @@ static void _fm_file_menu(const char *path, bool is_dir)
 
 	if (bis && !fm_ctx.bis_write_unlocked)
 	{
-		// Copy only until write access is unlocked.
-		static const char *mbox_btn_map_bis[] = { "\222Copy", "\222Close", "" };
+		// Clipboard staging only, until write access is unlocked. Cut just stages a future
+		// move; the unlock is enforced again when the move actually happens, at paste time.
+		static const char *mbox_btn_map_bis[] = { "\222Copy", "\222Cut", "\222Close", "" };
 		lv_mbox_add_btns(mbox, mbox_btn_map_bis, _fm_file_menu_action);
 	}
 	else
 		lv_mbox_add_btns(mbox, mbox_btn_map, _fm_file_menu_action);
 	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
 	lv_obj_set_top(mbox, true);
+}
+
+static void _fm_rename_cb(const char *text)
+{
+	if (!text[0])
+		return; // Cancelled/empty. Leave the listing as is.
+
+	if (!_fm_name_is_valid(text))
+	{
+		_fm_error_box("#FFDD00 Name has invalid characters!#");
+		return;
+	}
+
+	char new_path[FM_PATH_MAX];
+	char *slash = strrchr(fm_menu_path, '/');
+	u32 dir_len = slash ? (u32)(slash - fm_menu_path + 1) : 0;
+
+	if (dir_len + strlen(text) + 1 >= FM_PATH_MAX)
+	{
+		_fm_error_box("#FFDD00 Name is too long!#");
+		return;
+	}
+
+	memcpy(new_path, fm_menu_path, dir_len);
+	strcpy(new_path + dir_len, text);
+
+	if (!strcmp(new_path, fm_menu_path))
+		return; // Unchanged.
+
+	if (!f_stat(new_path, NULL))
+	{
+		_fm_error_box("#FFDD00 That name is already used!#");
+		return;
+	}
+
+	if (f_rename(fm_menu_path, new_path))
+		_fm_error_box("#FFDD00 Failed to rename!#");
+	else if (!strcmp(fm_ctx.clip_path, fm_menu_path)) // Keep the clipboard pointed at the renamed item.
+		strcpy(fm_ctx.clip_path, new_path);
+
+	_fm_list_dir(&fm_ctx);
 }
 
 static lv_res_t _fm_file_menu_action(lv_obj_t *btns, const char *txt)
@@ -777,6 +1152,23 @@ static lv_res_t _fm_file_menu_action(lv_obj_t *btns, const char *txt)
 	{
 		strcpy(fm_ctx.clip_path, fm_menu_path);
 		fm_ctx.clip_is_dir = fm_menu_is_dir;
+		fm_ctx.clip_is_cut = false;
+	}
+	else if (!strcmp(txt, "Cut"))
+	{
+		strcpy(fm_ctx.clip_path, fm_menu_path);
+		fm_ctx.clip_is_dir = fm_menu_is_dir;
+		fm_ctx.clip_is_cut = true;
+	}
+	else if (!strcmp(txt, "Rename"))
+	{
+		lv_obj_del(dark_bg);
+
+		char *base = strrchr(fm_menu_path, '/');
+		base = base ? base + 1 : fm_menu_path;
+		_fm_text_input_open(fm_menu_is_dir ? "#FF8000 Rename folder#" : "#FF8000 Rename file#", base, _fm_rename_cb);
+
+		return LV_RES_INV;
 	}
 	else if (!strcmp(txt, "Delete"))
 	{
@@ -795,8 +1187,6 @@ static lv_res_t _fm_file_menu_action(lv_obj_t *btns, const char *txt)
 static lv_res_t _fm_action_entry(lv_obj_t *btn)
 {
 	fm_ctx_t *ctx = &fm_ctx;
-	lv_obj_t *label = lv_list_get_btn_label(btn);
-	const char *name = lv_label_get_text(label);
 
 	// Drive selection.
 	if (!ctx->path[0])
@@ -827,14 +1217,16 @@ static lv_res_t _fm_action_entry(lv_obj_t *btn)
 		return LV_RES_OK;
 	}
 
-	char *path = (char *)malloc(FM_PATH_MAX);
-	_fm_path_join(path, ctx->path, name);
+	// Regular listing entries carry their backing fm_entry_t as the free_ptr tag.
+	fm_entry_t *e = (fm_entry_t *)lv_obj_get_free_ptr(btn);
+	if (!e)
+		return LV_RES_OK;
 
-	FILINFO fno;
-	bool is_dir = path[0] && !f_stat(path, &fno) && (fno.fattrib & AM_DIR);
+	char *path = (char *)malloc(FM_PATH_MAX);
+	_fm_path_join(path, ctx->path, e->name);
 
 	// Tap on folder enters it.
-	if (is_dir)
+	if (e->is_dir)
 	{
 		strcat(path, "/");
 		strcpy(ctx->path, path);
@@ -855,21 +1247,20 @@ static lv_res_t _fm_action_entry(lv_obj_t *btn)
 static lv_res_t _fm_action_entry_long(lv_obj_t *btn)
 {
 	fm_ctx_t *ctx = &fm_ctx;
-	lv_obj_t *label = lv_list_get_btn_label(btn);
-	const char *name = lv_label_get_text(label);
 
 	// No menu for root entries.
 	if (!ctx->path[0])
 		return LV_RES_OK;
 
-	char *path = (char *)malloc(FM_PATH_MAX);
-	_fm_path_join(path, ctx->path, name);
+	fm_entry_t *e = (fm_entry_t *)lv_obj_get_free_ptr(btn);
+	if (!e)
+		return LV_RES_OK;
 
-	FILINFO fno;
-	bool is_dir = path[0] && !f_stat(path, &fno) && (fno.fattrib & AM_DIR);
+	char *path = (char *)malloc(FM_PATH_MAX);
+	_fm_path_join(path, ctx->path, e->name);
 
 	if (path[0])
-		_fm_file_menu(path, is_dir);
+		_fm_file_menu(path, e->is_dir);
 	free(path);
 
 	return LV_RES_OK;
@@ -961,6 +1352,11 @@ static void _fm_list_dir(fm_ctx_t *ctx)
 {
 	lv_list_clean(ctx->list);
 
+	// Old entries' names back the free_ptr tags of the buttons just destroyed above.
+	free(ctx->entries);
+	ctx->entries = NULL;
+	ctx->entry_count = 0;
+
 	lv_list_add(ctx->list, NULL, SYMBOL_UP" ..", _fm_action_up);
 
 	if (!ctx->path[0]) // Drive selection.
@@ -996,7 +1392,7 @@ static void _fm_list_dir(fm_ctx_t *ctx)
 				lv_list_add(ctx->list, NULL, SYMBOL_DIRECTORY" New Folder", _fm_action_new_folder);
 
 				if (ctx->clip_path[0])
-					lv_list_add(ctx->list, NULL, SYMBOL_COPY" Paste", _fm_action_paste);
+					lv_list_add(ctx->list, NULL, ctx->clip_is_cut ? SYMBOL_COPY" Paste (Move)" : SYMBOL_COPY" Paste (Copy)", _fm_action_paste);
 
 				lv_list_add(ctx->list, NULL, SYMBOL_KEY" Lock writes", _fm_action_lock_emmc);
 			}
@@ -1011,27 +1407,42 @@ static void _fm_list_dir(fm_ctx_t *ctx)
 			lv_list_add(ctx->list, NULL, SYMBOL_DIRECTORY" New Folder", _fm_action_new_folder);
 
 			if (ctx->clip_path[0])
-				lv_list_add(ctx->list, NULL, SYMBOL_COPY" Paste", _fm_action_paste);
+				lv_list_add(ctx->list, NULL, ctx->clip_is_cut ? SYMBOL_COPY" Paste (Move)" : SYMBOL_COPY" Paste (Copy)", _fm_action_paste);
 		}
 
-		dirlist_t *dir = dirlist(ctx->path, NULL, DIR_SHOW_HIDDEN | DIR_SHOW_DIRS);
-		if (dir)
+		ctx->entries = _fm_read_dir(ctx->path, &ctx->entry_count);
+		for (u32 i = 0; i < ctx->entry_count; i++)
 		{
-			for (u32 i = 0; dir->name[i]; i++)
-			{
-				lv_obj_t *entry = lv_list_add(ctx->list, NULL, dir->name[i], _fm_action_entry);
-				lv_btn_set_action(entry, LV_BTN_ACTION_LONG_PR, _fm_action_entry_long);
-			}
-			free(dir);
+			fm_entry_t *e = &ctx->entries[i];
+			char size_buf[32];
+			char date_buf[32];
+
+			if (e->is_dir)
+				strcpy(size_buf, "<DIR>");
+			else
+				_fm_format_size(size_buf, e->size);
+			_fm_format_date(date_buf, e->fdate, e->ftime);
+
+			char label_buf[256 + 64];
+			s_printf(label_buf, "%s %s    %s    %s", e->is_dir ? SYMBOL_DIRECTORY : SYMBOL_FILE, e->name, size_buf, date_buf);
+
+			lv_obj_t *entry = lv_list_add(ctx->list, NULL, label_buf, _fm_action_entry);
+			lv_obj_set_free_ptr(entry, e);
+			lv_btn_set_action(entry, LV_BTN_ACTION_LONG_PR, _fm_action_entry_long);
 		}
 	}
 
-	// Update path label.
+	// Update path label, with free space on the current volume.
 	char *txt_buf = (char *)malloc(SZ_4K);
+	char free_buf[48];
+	free_buf[0] = 0;
+	if (ctx->path[0])
+		_fm_format_free_space(free_buf, ctx->path);
+
 	if (ctx->path[0] && ctx->bis_mounted && ctx->src_name)
-		s_printf(txt_buf, "Path: #C7EA46 [%s] %s#", ctx->src_name, ctx->path);
+		s_printf(txt_buf, "Path: #C7EA46 [%s] %s#%s", ctx->src_name, ctx->path, free_buf);
 	else
-		s_printf(txt_buf, "Path: #C7EA46 %s#", ctx->path);
+		s_printf(txt_buf, "Path: #C7EA46 %s#%s", ctx->path, free_buf);
 	lv_label_set_text(ctx->path_label, txt_buf);
 	free(txt_buf);
 
@@ -1042,6 +1453,10 @@ static lv_res_t _fm_action_close(lv_obj_t *btn)
 {
 	fm_ctx.clip_path[0] = 0;
 	fm_ctx.win = NULL;
+
+	free(fm_ctx.entries);
+	fm_ctx.entries = NULL;
+	fm_ctx.entry_count = 0;
 
 	if (fm_ctx.bis_mounted)
 		_fm_bis_unmount(&fm_ctx);
@@ -1067,6 +1482,7 @@ lv_res_t create_window_file_manager_tool(lv_obj_t *btn)
 	}
 
 	free(fm_ctx.emummc_file_dir);
+	free(fm_ctx.entries);
 
 	memset(&fm_ctx, 0, sizeof(fm_ctx));
 	list_init(&fm_ctx.bis_gpt);
